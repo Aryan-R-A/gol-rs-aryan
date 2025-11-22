@@ -5,6 +5,7 @@ use crate::util::cell::{CellValue, CellCoord};
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use sdl2::keyboard::Keycode;
+use std::thread;
 
 #[derive(Debug, Clone)]
 pub struct DistributorChannels {
@@ -61,25 +62,13 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
     //  read the current state from current & compute the next state into next.
     //  swap current and next so current always holds the latest world.
     for _ in 0..params.turns {
-        for y in 0..height {
-            for x in 0..width {
-                // Convert 2D coordinates (x, y) into a 1D index.
-                let idx = y * width + x;
-
-                // Count how many alive neighbours surround this cell.
-                let alive_neighbours = count_neighbours(&current, x, y, width, height);
-
-                let cell = current[idx];
-
-                // a live cell with 2 or 3 live neighbours survives.
-                // a dead cell with exactly 3 live neighbours becomes alive.
-                // all other cells become/stay dead.
-                next[idx] = match (cell, alive_neighbours) {
-                    (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
-                    _ => CellValue::Dead,
-                };
-            }
-        }
+        update_world_parallel(
+            &current,
+            &mut next,
+            width,
+            height,
+            params.threads,
+        );
 
         // Swap current and next
         std::mem::swap(&mut current, &mut next);
@@ -164,3 +153,66 @@ fn count_neighbours(
     count
 }
 
+/*helper func with helper threads
+- current is the read-only world for this turn.
+- next is the write-only buffer where we store the new state.
+- width & height define the grid dimensions.
+- threads is the number of worker threads to use.
+the rows [0, height) will be equal-sized chunks,
+and each worker is responsible a chunk */
+fn update_world_parallel(
+    current: &[CellValue],
+    next: &mut [CellValue],
+    width: usize,
+    height: usize,
+    threads: usize,
+) {
+    use std::thread;
+    // at least 1 thread and not more threads than rows.
+    let threads = threads.max(1).min(height);
+
+    let rows_per_thread = (height + threads - 1) / threads; // ceiling division
+
+    // use a thread::scope so that child threads can borrow current and next safely without needing Arc/Mutex
+    thread::scope(|scope| {
+        // next broken into chunks
+        let next_chunks: Vec<&mut [CellValue]> = next.chunks_mut(width * rows_per_thread).collect();
+
+        for (t, chunk) in next_chunks.into_iter().enumerate() {
+            let start_row = t * rows_per_thread;
+            if start_row >= height {
+                break;
+            }
+            let end_row = ((t + 1) * rows_per_thread).min(height);
+
+            let current_world = current;
+
+            // spawn the worker thread on the working section.
+            scope.spawn(move || {
+                // local y index goes from start_row..end_row, but for next_slice
+                // we global index into current but a local index into next_slice
+                for y in start_row..end_row {
+                    for x in 0..width {
+                        let idx = y * width + x;
+
+                        // count neighbours in current
+                        let alive_neighbours = count_neighbours(current_world, x, y, width, height);
+
+                        let cell = current_world[idx];
+
+                        let new_value = match (cell, alive_neighbours) {
+                            (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
+                            _ => CellValue::Dead,
+                        };
+
+                        // write to correct location in next_slice
+                        let local_y = y - start_row;
+                        let local_idx = local_y * width + x;
+
+                        chunk[local_idx] = new_value;
+                    }
+                }
+            });
+        }
+    });
+}
