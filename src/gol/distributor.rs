@@ -5,6 +5,8 @@ use crate::util::cell::{CellValue, CellCoord};
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use sdl2::keyboard::Keycode;
+//use std::thread;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct DistributorChannels {
@@ -57,29 +59,31 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         new_state: State::Executing,
     })?;
 
+/* FOR NO WORKER POOL IMPLEMENTATION WITH THREADS AND NOT RAYON
 
     //  read the current state from current & compute the next state into next.
     //  swap current and next so current always holds the latest world.
     for _ in 0..params.turns {
-        for y in 0..height {
-            for x in 0..width {
-                // Convert 2D coordinates (x, y) into a 1D index.
-                let idx = y * width + x;
+        update_world_parallel(
+            &current,
+            &mut next,
+            width,
+            height,
+            params.threads,
+        );
+*/
 
-                // Count how many alive neighbours surround this cell.
-                let alive_neighbours = count_neighbours(&current, x, y, width, height);
+    // build a fixed-size rayon thread pool .
+    // Rayon will create worker threads and reuse them
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(params.threads.max(1))
+        .build()
+        .expect("failed to build rayon thread pool");
 
-                let cell = current[idx];
-
-                // a live cell with 2 or 3 live neighbours survives.
-                // a dead cell with exactly 3 live neighbours becomes alive.
-                // all other cells become/stay dead.
-                next[idx] = match (cell, alive_neighbours) {
-                    (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
-                    _ => CellValue::Dead,
-                };
-            }
-        }
+    for _ in 0..params.turns {
+        // run game inside the pool.
+        // install executes using the pools worker threads.
+        pool.install(|| {update_world_parallel_rayon(&current, &mut next, width, height);});
 
         // Swap current and next
         std::mem::swap(&mut current, &mut next);
@@ -164,3 +168,112 @@ fn count_neighbours(
     count
 }
 
+/* FOR NO WORKER POOL IMPLEMENTATION WITH THREADS AND NOT RAYON
+
+/*helper func with helper threads
+- current is the read-only world for this turn.
+- next is the write-only buffer where we store the new state.
+- width & height define the grid dimensions.
+- threads is the number of worker threads to use.
+the rows [0, height) will be equal-sized chunks,
+and each worker is responsible a chunk */
+fn update_world_parallel(
+    current: &[CellValue],
+    next: &mut [CellValue],
+    width: usize,
+    height: usize,
+    threads: usize,
+) {
+    use std::thread;
+    // at least 1 thread and not more threads than rows.
+    let threads = threads.max(1).min(height);
+
+    let rows_per_thread = (height + threads - 1) / threads; // ceiling division
+
+    // use a thread::scope so that child threads can borrow current and next from stack
+    thread::scope(|scope| {
+        // next broken into chunks that dont overlap
+        let next_chunks: Vec<&mut [CellValue]> = next.chunks_mut(width * rows_per_thread).collect();
+
+        //one chunk per thread 
+        for (t, chunk) in next_chunks.into_iter().enumerate() {
+            //compute the global row range [start_row, end_row) for this chunk.
+            let start_row = t * rows_per_thread;
+            if start_row >= height {
+                break; //break if no more rows remain
+            }
+            let end_row = ((t + 1) * rows_per_thread).min(height);
+
+            let current_world = current; //read only
+
+            // spawn the worker thread for this chunk of rows
+            scope.spawn(move || {
+                // chunk only has start_row..end_row , we loop using global index y
+                //but when we're writing into the chunk we convert it into local row index
+                for y in start_row..end_row {
+                    for x in 0..width {
+                        let idx = y * width + x;    // globval index into the flat current_world
+
+                        // count neighbours in current
+                        let alive_neighbours = count_neighbours(current_world, x, y, width, height);
+
+                        let cell = current_world[idx];
+
+                        let new_value = match (cell, alive_neighbours) {
+                            (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
+                            _ => CellValue::Dead,
+                        };
+
+                        // write to correct location in next_slice
+                        let local_y = y - start_row;
+                        let local_idx = local_y * width + x;
+
+                        chunk[local_idx] = new_value;
+                    }
+                }
+            });
+        }
+    });
+}
+*/
+
+
+// current is the read-only world for this turn.
+// next is the buffer we write the next generation into.
+// width and height define the 2D grid, but both current and next are stored as flat 1D arrays of length width * height.
+fn update_world_parallel_rayon(
+    current: &[CellValue],
+    next: &mut [CellValue],
+    width: usize,
+    height: usize,
+) {
+    
+
+    next.par_chunks_mut(width) // splits next into mutable chunks (rows) of length width; each row can be processed independently in parallel by different worker threads.
+        .enumerate()
+        .for_each(|(y, row)| {
+            // y here is the row index (0..height),
+            // row is &mut [CellValue] for that row in next
+
+            let y = y; // just to make the type clear: usize
+
+            for x in 0..width {
+                // global index into the flat current buffer.
+                let idx = y * width + x;
+
+                // count neighbours in the full current world.
+                let alive_neighbours =
+                    count_neighbours(current, x, y, width, height);
+
+                let cell = current[idx];
+
+                let new_value = match (cell, alive_neighbours) {
+                    (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
+                    _ => CellValue::Dead,
+                };
+
+                // write result into the correct column of this row in next
+                row[x] = new_value;
+            }
+        });
+}
