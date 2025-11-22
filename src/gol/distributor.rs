@@ -5,7 +5,8 @@ use crate::util::cell::{CellValue, CellCoord};
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use sdl2::keyboard::Keycode;
-use std::thread;
+//use std::thread;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct DistributorChannels {
@@ -58,6 +59,7 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         new_state: State::Executing,
     })?;
 
+/* FOR NO WORKER POOL IMPLEMENTATION WITH THREADS AND NOT RAYON
 
     //  read the current state from current & compute the next state into next.
     //  swap current and next so current always holds the latest world.
@@ -69,6 +71,19 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
             height,
             params.threads,
         );
+*/
+
+    // build a fixed-size rayon thread pool .
+    // Rayon will create worker threads and reuse them
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(params.threads.max(1))
+        .build()
+        .expect("failed to build rayon thread pool");
+
+    for _ in 0..params.turns {
+        // run game inside the pool.
+        // install executes using the pools worker threads.
+        pool.install(|| {update_world_parallel_rayon(&current, &mut next, width, height);});
 
         // Swap current and next
         std::mem::swap(&mut current, &mut next);
@@ -153,6 +168,8 @@ fn count_neighbours(
     count
 }
 
+/* FOR NO WORKER POOL IMPLEMENTATION WITH THREADS AND NOT RAYON
+
 /*helper func with helper threads
 - current is the read-only world for this turn.
 - next is the write-only buffer where we store the new state.
@@ -173,27 +190,29 @@ fn update_world_parallel(
 
     let rows_per_thread = (height + threads - 1) / threads; // ceiling division
 
-    // use a thread::scope so that child threads can borrow current and next safely without needing Arc/Mutex
+    // use a thread::scope so that child threads can borrow current and next from stack
     thread::scope(|scope| {
-        // next broken into chunks
+        // next broken into chunks that dont overlap
         let next_chunks: Vec<&mut [CellValue]> = next.chunks_mut(width * rows_per_thread).collect();
 
+        //one chunk per thread 
         for (t, chunk) in next_chunks.into_iter().enumerate() {
+            //compute the global row range [start_row, end_row) for this chunk.
             let start_row = t * rows_per_thread;
             if start_row >= height {
-                break;
+                break; //break if no more rows remain
             }
             let end_row = ((t + 1) * rows_per_thread).min(height);
 
-            let current_world = current;
+            let current_world = current; //read only
 
-            // spawn the worker thread on the working section.
+            // spawn the worker thread for this chunk of rows
             scope.spawn(move || {
-                // local y index goes from start_row..end_row, but for next_slice
-                // we global index into current but a local index into next_slice
+                // chunk only has start_row..end_row , we loop using global index y
+                //but when we're writing into the chunk we convert it into local row index
                 for y in start_row..end_row {
                     for x in 0..width {
-                        let idx = y * width + x;
+                        let idx = y * width + x;    // globval index into the flat current_world
 
                         // count neighbours in current
                         let alive_neighbours = count_neighbours(current_world, x, y, width, height);
@@ -215,4 +234,46 @@ fn update_world_parallel(
             });
         }
     });
+}
+*/
+
+
+// current is the read-only world for this turn.
+// next is the buffer we write the next generation into.
+// width and height define the 2D grid, but both current and next are stored as flat 1D arrays of length width * height.
+fn update_world_parallel_rayon(
+    current: &[CellValue],
+    next: &mut [CellValue],
+    width: usize,
+    height: usize,
+) {
+    
+
+    next.par_chunks_mut(width) // splits next into mutable chunks (rows) of length width; each row can be processed independently in parallel by different worker threads.
+        .enumerate()
+        .for_each(|(y, row)| {
+            // y here is the row index (0..height),
+            // row is &mut [CellValue] for that row in next
+
+            let y = y; // just to make the type clear: usize
+
+            for x in 0..width {
+                // global index into the flat current buffer.
+                let idx = y * width + x;
+
+                // count neighbours in the full current world.
+                let alive_neighbours =
+                    count_neighbours(current, x, y, width, height);
+
+                let cell = current[idx];
+
+                let new_value = match (cell, alive_neighbours) {
+                    (CellValue::Alive, 2) | (_, 3) => CellValue::Alive,
+                    _ => CellValue::Dead,
+                };
+
+                // write result into the correct column of this row in next
+                row[x] = new_value;
+            }
+        });
 }
