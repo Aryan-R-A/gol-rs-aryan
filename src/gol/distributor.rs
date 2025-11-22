@@ -5,7 +5,9 @@ use crate::util::cell::{CellValue, CellCoord};
 use anyhow::Result;
 use flume::{Receiver, Sender};
 use sdl2::keyboard::Keycode;
-//use std::thread;
+use std::thread;
+use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::time::Duration;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -19,6 +21,12 @@ pub struct DistributorChannels {
     pub io_output: Option<Sender<CellValue>>,
 }
 
+// shared stats used by the AliveCellsCount ticker thread.
+pub struct AliveStats {
+    turns: AtomicU32, // completed turns so far.
+    cells: AtomicU32, // alive cells in the latest completed world.
+}
+
 pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> {
     let events = channels.events.as_ref().unwrap();
     let key_presses = channels.key_presses.as_ref().unwrap();
@@ -26,6 +34,73 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
     let io_idle = channels.io_idle.as_ref().unwrap();
     let io_filename = channels.io_filename.as_ref().unwrap();
     let io_input = channels.io_input.as_ref().unwrap();
+    let io_output   = channels.io_output.as_ref().unwrap();
+
+
+    // shared state for the AliveCellsCount ticker 
+    // start with 0 turns and 0 alive cells.
+    let stats = Arc::new(AliveStats {
+        turns: AtomicU32::new(0),
+        cells: AtomicU32::new(0),
+    });
+
+    // clone the Arc and the events sender for the ticker thread
+    let stats_for_ticker = Arc::clone(&stats);
+    let events_for_ticker = events.clone();
+
+    // spawn a dedicated thread that wakes up every 2 seconds and
+    // sends an AliveCellsCount event with the latest stats.
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));      // sleep for 2 seconds between reports
+
+            // read the most recent values written by the main loop
+            let current_turns = stats_for_ticker.turns.load(Ordering::Relaxed);
+            let current_cells = stats_for_ticker.cells.load(Ordering::Relaxed);
+
+            // send AliveCellsCount.
+
+            if events_for_ticker
+                .send(Event::AliveCellsCount {
+                    completed_turns: current_turns,
+                    cells_count: current_cells,
+                })
+                .is_err()            // If the receiver has been dropped, send() will return Err and we exit the thread
+            {
+                break;
+            }
+        }
+    });
+
+    // Clone the Arc and the events sender for the ticker thread.
+    let stats_for_ticker = Arc::clone(&stats);
+    let events_for_ticker = events.clone();
+
+    // Spawn a dedicated thread that wakes up every 2 seconds and
+    // sends an AliveCellsCount event with the latest stats.
+    thread::spawn(move || {
+        loop {
+            // Sleep for 2 seconds between reports.
+            thread::sleep(Duration::from_secs(2));
+
+            // Read the most recent values written by the main loop.
+            let current_turns = stats_for_ticker.turns.load(Ordering::Relaxed);
+            let current_cells = stats_for_ticker.cells.load(Ordering::Relaxed);
+
+            // Try to send AliveCellsCount.
+            // If the receiver has been dropped (e.g. distributor finished),
+            // send() will return Err and we exit the thread.
+            if events_for_ticker
+                .send(Event::AliveCellsCount {
+                    completed_turns: current_turns,
+                    cells_count: current_cells,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
     // get the dimensions of the world.
     let width = params.image_width;
@@ -44,8 +119,8 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
     io_command.send(IoCommand::IoInput)?;
 
     // send the image name to IO.
-    let fname = format!("{}x{}", width, height);
-    io_filename.send(fname)?;
+    let input_name = format!("{}x{}", width, height);
+    io_filename.send(input_name)?;
 
     // fill current buffer with CellValues received from IO.
     // read_pgm_image in io.rs will send exactly width*height cells.
@@ -70,8 +145,10 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
             width,
             height,
             params.threads,
-        );
-*/
+        );*/
+
+
+
 
     // build a fixed-size rayon thread pool .
     // Rayon will create worker threads and reuse them
@@ -90,7 +167,26 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
 
         // one turn completed
         completed_turns += 1;
+
+        // update shared stats for the ticker thread &
+        // count how many cells are alive in the current world.
+        let mut alive_count: u32 = 0;
+        for cell in current.iter() {
+            if *cell == CellValue::Alive {
+                alive_count += 1;
+            }
+        }
+
+        // store the latest completed turn and alive cell count
+        stats.turns.store(completed_turns, Ordering::Relaxed);
+        stats.cells.store(alive_count, Ordering::Relaxed);
+
+        //notify test that turn is completed
+        events.send(Event::TurnComplete {
+            completed_turns,
+        })?;
     }
+    
 
 
     // build a list of all alive cells in the final world.
@@ -116,8 +212,29 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         alive: alive_cells,
     })?;
 
+    // IO will now save this to "out/<width>x<height>.pgm"
+    let output_name = format!("{}x{}x{}", width, height, params.turns); 
 
-    // Make sure that the Io has finished any output before exiting.
+    // Tell the IO command we want to output an image.
+    io_command.send(IoCommand::IoOutput)?;
+
+    // send the filename to IO so it knows what to call the file
+    io_filename.send(output_name.clone())?;
+
+    // send each cell's buffer to IO
+    // IO's write_pgm_image() will read exactly width*height CellValue values
+    // from the output channel and write them into the file.
+    for cell in current.iter() {
+        io_output.send(*cell)?;
+    }
+
+    // notify that image output has completed
+    events.send(Event::ImageOutputComplete {
+        completed_turns,
+        filename: output_name,
+    })?;
+
+    // verify Io has finished any output before exiting
     io_command.send(IoCommand::IoCheckIdle)?;
     io_idle.recv()?;
 
@@ -170,13 +287,13 @@ fn count_neighbours(
 
 /* FOR NO WORKER POOL IMPLEMENTATION WITH THREADS AND NOT RAYON
 
-/*helper func with helper threads
+helper func with helper threads
 - current is the read-only world for this turn.
 - next is the write-only buffer where we store the new state.
 - width & height define the grid dimensions.
 - threads is the number of worker threads to use.
 the rows [0, height) will be equal-sized chunks,
-and each worker is responsible a chunk */
+and each worker is responsible a chunk 
 fn update_world_parallel(
     current: &[CellValue],
     next: &mut [CellValue],
@@ -184,6 +301,7 @@ fn update_world_parallel(
     height: usize,
     threads: usize,
 ) {
+
     use std::thread;
     // at least 1 thread and not more threads than rows.
     let threads = threads.max(1).min(height);
@@ -233,9 +351,8 @@ fn update_world_parallel(
                 }
             });
         }
-    });
-}
-*/
+    }); }*/
+
 
 
 // current is the read-only world for this turn.
