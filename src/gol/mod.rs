@@ -12,7 +12,7 @@ pub mod distributor;
 pub mod event;
 pub mod io;
 
-/// `Params` provides the details of how to run the Game of Life and which image to load.
+/// Params provides the details of how to run the Game of Life and which image to load.
 #[derive(Clone, Debug)]
 pub struct Params {
     pub turns: usize,

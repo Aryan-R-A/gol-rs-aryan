@@ -6,7 +6,7 @@ use anyhow::Result;
 use flume::{Receiver, Sender};
 use sdl2::keyboard::Keycode;
 use std::thread;
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use rayon::prelude::*;
 
@@ -23,57 +23,11 @@ pub struct DistributorChannels {
 
 // shared stats used by the AliveCellsCount ticker thread.
 pub struct AliveStats {
-    turns: AtomicU32, // completed turns so far.
-    cells: AtomicU32, // alive cells in the latest completed world.
+    pub turns: u32,
+    pub cells: u32,
 }
 
-// A headless runner used only for benchmarks: no IO thread, no SDL, no key presses.
-// It just runs the parallel world update for `turns` iterations on a `width` x `height` grid.
-pub fn run_benchmark_world(turns: u32, width: usize, height: usize) {
-    use crate::util::cell::CellValue;
-    use flume;
 
-    // Allocate two worlds
-    let mut current = vec![CellValue::Dead; width * height];
-    let mut next = vec![CellValue::Dead; width * height];
-
-    // Optional: seed a tiny pattern so it's not completely static
-    if width >= 3 && height >= 3 {
-        let x = width / 2;
-        let y = height / 2;
-        current[y * width + x] = CellValue::Alive;
-    }
-
-    // Dummy event channel; we don't care about events in the benchmark.
-    let (events_tx, events_rx) = flume::unbounded::<Event>();
-
-    // Shared stats for AliveCellsCount (ticker thread is NOT used here)
-    let stats = std::sync::Arc::new(AliveStats {
-        turns: std::sync::atomic::AtomicU32::new(0),
-        cells: std::sync::atomic::AtomicU32::new(0),
-    });
-
-    let mut completed_turns: u32 = 0;
-
-    for _ in 0..turns {
-        // Run one turn of the simulation.
-        let _ = do_one_turn(
-            &current,
-            &mut next,
-            width,
-            height,
-            &events_tx,
-            &stats,
-            &mut completed_turns,
-        );
-
-        // Swap buffers so `current` is always the latest world.
-        std::mem::swap(&mut current, &mut next);
-
-        // Drain any events so the channel doesn't grow without bound.
-        while events_rx.try_recv().is_ok() {}
-    }
-}
 
 pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> {
     let events = channels.events.as_ref().unwrap();
@@ -92,7 +46,7 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
     let mut current = vec![CellValue::Dead; width * height];
     let mut next = vec![CellValue::Dead; width * height];
 
-    // completed turns tracked; u32 to match Event types.
+    // completed turns tracked; u32 to match Event types
     let mut completed_turns: u32 = 0;
     let total_turns: u32 = params.turns as u32;
 
@@ -103,37 +57,42 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
     let input_name = format!("{}x{}", width, height);
     io_filename.send(input_name)?;
 
-    // fill current buffer with CellValues received from IO.
-    // read_pgm_image in io.rs will send exactly width*height cells.
+    // fill current buffer with CellValues received from IO
+    // read_pgm_image in io.rs will send exactly width*height cells
     for cell in current.iter_mut() {
         *cell = io_input.recv()?; // blocking receive from IO
     }
 
     // shared state for the AliveCellsCount ticker 
     // start with 0 turns and 0 alive cells.
-    let stats = Arc::new(AliveStats {
-        turns: AtomicU32::new(0),
-        cells: AtomicU32::new(0),
-    });
+    // start with 0 turns and 0 alive cells.
+    let stats = Arc::new(Mutex::new(AliveStats {
+        turns: 0,
+        cells: 0,
+    }));
+
 
     {
-        // Clone the Arc and the events sender for the ticker thread.
+        // clone the Arc and the events sender for the ticker thread
         let stats_for_ticker = Arc::clone(&stats);
         let events_for_ticker = events.clone();
 
-        // Spawn a dedicated thread that wakes up every 2 seconds and
+        // spawn a dedicated thread that wakes up every 2 seconds and
         // sends an AliveCellsCount event with the latest stats.
         thread::spawn(move || {
             loop {
-                // Sleep for 2 seconds between reports.
+                // sleep for 2 seconds between reports
                 thread::sleep(Duration::from_secs(2));
 
-                // Read the most recent values written by the main loop.
-                let turns = stats_for_ticker.turns.load(Ordering::SeqCst);
-                let cells = stats_for_ticker.cells.load(Ordering::SeqCst);
+                // read the most recent values written by the main loop
+                let (turns, cells) = {
+                    let s = stats_for_ticker.lock().unwrap();
+                    (s.turns, s.cells)
+                };
 
-                // Try to send AliveCellsCount.
-                // If the receiver has been dropped (e.g. distributor finished),
+
+                // try to send AliveCellsCount
+                // if the receiver has been dropped (e.g. distributor finished),
                 // send() will return Err and we exit the thread.
                 if events_for_ticker
                     .send(Event::AliveCellsCount {
@@ -142,7 +101,7 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
                     })
                     .is_err()
                 {
-                    break;// Receiver was dropped; stop the ticker.
+                    break;// receiver was dropped; stop the ticker.
                 }
             }
         });
@@ -159,11 +118,10 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         }
     }
 
-    if !initial_cells.is_empty() {
-        events.send(Event::CellsFlipped {
-            completed_turns: 0,   // this is the initial state
-            cells: initial_cells,
-        })?;
+    if !initial_cells.is_empty() 
+    {
+        // this is the initial state
+        events.send(Event::CellsFlipped {completed_turns: 0,cells: initial_cells})?;
     }
 
     //start the execute
@@ -193,10 +151,10 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
 
     // run until we either complete all turns or the user presses 'q'.
     while completed_turns < total_turns {
-        // Non-blocking key processing
+        // non-blocking key processing
         while let Ok(key) = key_presses.try_recv() {
             match key {
-                // Toggle pause
+                // toggle pause
                 Keycode::P => {
                     paused = !paused;
                     let new_state = if paused { State::Pause } else { State::Executing };
@@ -206,14 +164,14 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
                     })?;
                 }
 
-                // Quit request
+                // quit request
                 Keycode::Q => {
-                // Just mark that we should quit.
-                // The final output + events are handled after the loop.
+                // just mark that we should quit
+                // the final output & events are handled after the loop
                 quitting = true;
                 }
 
-                // Single step
+                // single step (snaoshot of workld)
                 Keycode::S => {
                         let output_name = format!("{}x{}x{}", width, height, completed_turns);
 
@@ -229,13 +187,14 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
                             filename: output_name,
                         })?;
 
-                        // S *must* block for idle to satisfy test timing
+                        // s must block for idle for test timing to work
+                        // aka wait for IO to finish so the test can see the file
                         io_command.send(IoCommand::IoCheckIdle)?;
                         io_idle.recv()?;
                     }
                 
 
-                _ => { /* ignore */ }
+                _ => { /*ignore rest */ }
             }
         }
 
@@ -243,13 +202,10 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
             break;
         }
 
-        // ---- PAUSE MODE ----
-        if paused {
-            thread::sleep(Duration::from_millis(5));
-            continue;
-        }
+        // light sleep so we’re not busy while paused.
+        if paused {thread::sleep(Duration::from_millis(5));continue;}
 
-        // ---- NORMAL STEP ----
+        // normal turn 
         do_one_turn(
             &current,
             &mut next,
@@ -261,16 +217,16 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         )?;
         std::mem::swap(&mut current, &mut next);
         
-        // If Q was pressed during this turn, we’re done after this turn.
+        // if Q was pressed during this turn, we’re done after this turn.
         if quitting {
             break;
         }
     
     }
 
-    // ---- After the loop: send final world state ----
+    // after the loop => send final world state
 
-    // Collect all alive cells in the final world
+    // collect all alive cells in the final world
     let mut alive_cells: Vec<CellCoord<usize>> = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -281,36 +237,36 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
         }
     }
 
-    // 1) Tell SDL/tests that this is the final turn and final world
+    // Tell SDL & tests that this is the final turn and final world
     events.send(Event::FinalTurnComplete {
         completed_turns,
         alive: alive_cells,
     })?;
 
-    // 2) Output final snapshot: filename must use completed_turns
+    // output final snapshot for last completed_turns
     let output_name = format!("{}x{}x{}", width, height, completed_turns);
 
-    // Tell IO we want to output an image
+    // tell IO we want to output an image
     io_command.send(IoCommand::IoOutput)?;
-    // Send the filename to IO
+    // send the filename to IO
     io_filename.send(output_name.clone())?;
 
-    // Send each cell to IO
+    // send each cell to IO
     for cell in current.iter() {
         io_output.send(*cell)?;
     }
 
-    // 3) Notify that image output has completed
+    // notify that image output has completed
     events.send(Event::ImageOutputComplete {
         completed_turns,
         filename: output_name,
     })?;
 
-    // 4) Verify IO has finished any output before exiting
+    // verify IO has finished any output before exiting
     io_command.send(IoCommand::IoCheckIdle)?;
     io_idle.recv()?;
 
-    // 5) Finally, tell SDL/tests that we’re quitting
+    // finally, tell SDL/tests that we’re quitting
     events.send(Event::StateChange {
         completed_turns,
         new_state: State::Quitting,
@@ -320,10 +276,8 @@ pub fn distributor(params: Params, channels: DistributorChannels) -> Result<()> 
 }
 
 
-//does one turn
-/// - send CellsFlipped + TurnComplete
-/// - update AliveStats for the ticker
-fn do_one_turn(current: &[CellValue],next: &mut [CellValue],width: usize,height: usize,events: &Sender<Event>,stats: &Arc<AliveStats>,completed_turns: &mut u32,) 
+// does one turn
+fn do_one_turn(current: &[CellValue],next: &mut [CellValue],width: usize,height: usize,events: &Sender<Event>,stats: &Arc<Mutex<AliveStats>>,completed_turns: &mut u32,) 
 -> Result<()> {
     // compute the next gen into next
     update_world_parallel_rayon(current, next, width, height);
@@ -334,7 +288,7 @@ fn do_one_turn(current: &[CellValue],next: &mut [CellValue],width: usize,height:
         for x in 0..width {
             let idx = y * width + x;
             if current[idx] != next[idx] {
-                flipped_cells.push(CellCoord { x, y });
+                flipped_cells.push(CellCoord { x, y }); //send Cellsflipped 
             }
         }
     }
@@ -343,14 +297,19 @@ fn do_one_turn(current: &[CellValue],next: &mut [CellValue],width: usize,height:
     *completed_turns += 1;
 
     // count alive cells in the new world
-    let alive_count = next
-        .iter()
-        .filter(|c| **c == CellValue::Alive)
-        .count() as u32;
+    let mut alive_count = 0;
+    for cell in next {
+        if *cell == CellValue::Alive {
+            alive_count += 1;
+        }
+    }
+    //update stats for ticker
+    {
+    let mut s = stats.lock().unwrap();
+    s.cells = alive_count;
+    s.turns = *completed_turns;
+    }
 
-    //update stats
-    stats.cells.store(alive_count, Ordering::SeqCst);
-    stats.turns.store(*completed_turns, Ordering::SeqCst);
 
     // inform SDL/tests of flipped cells in this turn
     if !flipped_cells.is_empty() {
@@ -369,7 +328,7 @@ fn do_one_turn(current: &[CellValue],next: &mut [CellValue],width: usize,height:
     Ok(())
 }
 
-// helper func that Coucountsnt the number of alive neighbours around the cell at (x, y).
+// helper func that counts the number of alive neighbours around the cell at (x, y).
 // the world is stored as a flat slice world of length width * height and has grid wrapping
 fn count_neighbours(
     world: &[CellValue],
@@ -482,6 +441,7 @@ fn update_world_parallel(
 // current is the read-only world for this turn.
 // next is the buffer we write the next generation into.
 // width and height define the 2D grid, but both current and next are stored as flat 1D arrays of length width * height.
+// long story short this is the Parallel update: next <- f(current).
 fn update_world_parallel_rayon(
     current: &[CellValue],
     next: &mut [CellValue],
@@ -506,4 +466,54 @@ fn update_world_parallel_rayon(
                 };
             }
         });
+}
+
+
+
+// original bench didnt work so i implemented this function
+// used only for benchmarks: no IO thread, no SDL, no key presses
+// it just runs the parallel world update for turns iterations on a width x height grid.
+pub fn run_benchmark_world(turns: u32, width: usize, height: usize) {
+    use crate::util::cell::CellValue;
+    use flume;
+
+    // allocate two worlds
+    let mut current = vec![CellValue::Dead; width * height];
+    let mut next = vec![CellValue::Dead; width * height];
+
+    if width >= 3 && height >= 3 {
+        let x = width / 2;
+        let y = height / 2;
+        current[y * width + x] = CellValue::Alive;
+    }
+
+    // we dont care about events in the benchmark.
+    let (events_tx, events_rx) = flume::unbounded::<Event>();
+
+    // shared stats for AliveCellsCount (ticker thread is NOT used here)
+    let stats = Arc::new(std::sync::Mutex::new(AliveStats {
+        turns: 0,
+        cells: 0,
+    }));
+
+    let mut completed_turns: u32 = 0;
+
+    for _ in 0..turns {
+        // run one turn of the simulation.
+        let _ = do_one_turn(
+            &current,
+            &mut next,
+            width,
+            height,
+            &events_tx,
+            &stats,
+            &mut completed_turns,
+        );
+
+        // swap buffers so current is always the latest world.
+        std::mem::swap(&mut current, &mut next);
+
+        // drain any events so the channel doesn't grow without bound.
+        while events_rx.try_recv().is_ok() {}
+    }
 }

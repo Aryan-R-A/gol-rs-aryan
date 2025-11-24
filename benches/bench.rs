@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use gol_rs::gol::distributor::run_benchmark_world; // adjust path to where you put it
-use rayon::ThreadPoolBuilder; // add this
+use gol_rs::gol::distributor::run_benchmark_world;
+use rayon::ThreadPoolBuilder;
 
 fn bench_gol(c: &mut Criterion) {
     let mut group = c.benchmark_group("Gol Benchmark");
@@ -13,7 +13,6 @@ fn bench_gol(c: &mut Criterion) {
     let height = 512usize;
     let turns = 1000u32;
 
-    // Only benchmark a few sensible thread counts
     let thread_counts = [1usize, 2, 4, 8, 16];
 
     for &threads in &thread_counts {
@@ -21,14 +20,14 @@ fn bench_gol(c: &mut Criterion) {
             BenchmarkId::new("Threads", threads),
             &threads,
             |bencher, &t| {
-                // Build a dedicated Rayon thread pool of size t
+                // builds a dedicated Rayon thread pool of size t
                 let pool = ThreadPoolBuilder::new()
                     .num_threads(t)
                     .build()
                     .unwrap();
 
                 bencher.iter(|| {
-                    // Run the benchmarked world INSIDE this pool
+                    // run the benchmarked world inside this pool
                     pool.install(|| {
                         run_benchmark_world(turns, width, height);
                     });
