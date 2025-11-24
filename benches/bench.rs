@@ -1,40 +1,42 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use gol_rs::{args::Args, gol::{self, event::Event}};
-use sdl2::keyboard::Keycode;
+use gol_rs::gol::distributor::run_benchmark_world; // adjust path to where you put it
+use rayon::ThreadPoolBuilder; // add this
 
 fn bench_gol(c: &mut Criterion) {
     let mut group = c.benchmark_group("Gol Benchmark");
+
     group
         .sampling_mode(criterion::SamplingMode::Flat)
         .sample_size(10);
-    for thread in 1..=num_cpus::get() {
+
+    let width = 512usize;
+    let height = 512usize;
+    let turns = 1000u32;
+
+    // Only benchmark a few sensible thread counts
+    let thread_counts = [1usize, 2, 4, 8, 16];
+
+    for &threads in &thread_counts {
         group.bench_with_input(
-            BenchmarkId::new("Threads", thread),
-            &thread,
-            |bencher, thread|
-            {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
+            BenchmarkId::new("Threads", threads),
+            &threads,
+            |bencher, &t| {
+                // Build a dedicated Rayon thread pool of size t
+                let pool = ThreadPoolBuilder::new()
+                    .num_threads(t)
                     .build()
                     .unwrap();
-                bencher.to_async(runtime).iter(|| async {
-                    let args = Args::default()
-                        .turns(1000)
-                        .threads(*thread)
-                        .image_width(512)
-                        .image_height(512);
-                    let (_key_presses_tx, key_presses_rx) = flume::bounded::<Keycode>(10);
-                    let (events_tx, events_rx) = flume::bounded::<Event>(1000);
-                    tokio::spawn(gol::run(args, events_tx, key_presses_rx));
-                    loop {
-                        if events_rx.recv_async().await.is_err() {
-                            break;
-                        }
-                    }
-                })
-            }
+
+                bencher.iter(|| {
+                    // Run the benchmarked world INSIDE this pool
+                    pool.install(|| {
+                        run_benchmark_world(turns, width, height);
+                    });
+                });
+            },
         );
     }
+
     group.finish();
 }
 
