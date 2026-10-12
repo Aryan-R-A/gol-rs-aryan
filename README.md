@@ -108,6 +108,18 @@ RAYON_NUM_THREADS=2 cargo test --test sdl
 Inspect the harnesses in [tests/](tests/) for their exact workload and options.
 These checks are not proof of exhaustive race freedom or correct worker-pool sizing.
 
+### Verified checks
+
+On 12 October 2026, a fresh locked build passed with Rust 1.91.1 and SDL2 2.30.0.
+Local checks passed **18 reference-board cases** and **144 PGM-output cases**,
+with the real Rayon pool fixed at two workers. These are fixture checks, not a scaling study.
+
+[The CI workflow](.github/workflows/rust.yml) checks all targets and runs 18 cases in
+each of those two harnesses with locked dependencies.
+[CI run 38272141766](https://github.com/Aryan-R-A/gol-rs-aryan/actions/runs/38272141766)
+verified the proposed workflow successfully before it was merged. Population-reporting
+and interactive harnesses are not included in this CI job.
+
 ## Benchmarks and evidence
 
 ```bash
@@ -136,7 +148,7 @@ State separately whether each number measures only simulation or the complete ap
 - Benchmark a deterministic nontrivial population alongside the current workload.
 - Review ticker lifecycle and explicit shutdown across repeated simulations.
 - Validate dimensions, multiplication overflow and turn-count conversion.
-- Add automated checks and a committed lockfile for reproducible application builds.
+- Extend CI to population-reporting and interaction checks after their timing is characterised.
 - A tracked file named `src/gol/distributor.rs:32:9` is a stray empty artefact;
   review its removal separately rather than silently deleting evidence.
 
