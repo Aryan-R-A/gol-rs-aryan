@@ -1,0 +1,31 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RAYON_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the verified Rust toolchain
+        run: |
+          rustup toolchain install 1.91.1 --profile minimal
+          rustup default 1.91.1
+      - name: Install SDL2 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libsdl2-dev
+      - name: Check all targets with locked dependencies
+        run: cargo check --locked --all-targets
+      - name: Reference-board correctness
+        run: cargo test --locked --test gol -- -t 2
+      - name: PGM output correctness
+        run: cargo test --locked --test pgm -- -t 2
