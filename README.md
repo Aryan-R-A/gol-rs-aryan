@@ -12,7 +12,8 @@ This project extends the University of Bristol's
 [Game of Life Rust skeleton](https://github.com/UoB-CSA/gol-rs-skeleton).
 The supplied framework, fixtures and custom test harnesses remain university work.
 
-Aryan's commit history records the simulation and parallelisation work, including the
+Aryan confirms that he independently implemented the Rust extension. His commit history
+records the simulation and parallelisation work, including the
 [worker-pool milestone](https://github.com/Aryan-R-A/gol-rs-aryan/commit/ae4edb4295df70f4f6d7f8a989a23331f7f8a905)
 and [subsequent parallel implementation](https://github.com/Aryan-R-A/gol-rs-aryan/commit/316574c5aa60f53f8807d08ab258d77affe09470).
 The active implementation is in [src/gol/distributor.rs](src/gol/distributor.rs);
